@@ -1,499 +1,337 @@
 #!/usr/bin/env python3
-"""
-FastMCP Server for RAG System
-Exposes technical document search capabilities via Model Context Protocol
-"""
-
-# ============================================================================
-# SET ENVIRONMENT VARIABLES (MUST BE BEFORE IMPORTS!)
-# ============================================================================
-import os
-import sys
+"""FastMCP Server for RAG Document Search"""
+import os, sys, pickle, re
 from pathlib import Path
+from typing import List, Dict, Any
+from collections import defaultdict
 
-# RAG Configuration (matching simple-rag.py)
-VECTOR_DB_PATH = './database'
+# Config
+VECTOR_DB_PATH = './chroma_store'
 BM25_INDEX_PATH = './bm25_index.pkl'
-MODELS_DIR = './models'
-EMBEDDING_MODEL = 'intfloat/multilingual-e5-large'
+MODELS_DIR = Path('./models')
+EMBEDDING_MODEL_PATH = MODELS_DIR / 'multilingual-e5-large'
+RERANKER_MODEL_PATH = MODELS_DIR / 'bge-reranker-v2-m3'
 COLLECTION_NAME = 'technical_documents'
 SEMANTIC_WEIGHT = 0.7
-USE_LOCAL_MODELS_ONLY = True
+USE_RERANKER = True  # Set to False to disable reranking
 
-# Set environment for offline mode - MUST BE BEFORE OTHER IMPORTS
-os.environ['SENTENCE_TRANSFORMERS_HOME'] = str(Path(MODELS_DIR).absolute())
-os.environ['HF_DATASETS_OFFLINE'] = '1'
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
-os.environ['HF_HUB_OFFLINE'] = '1'  # Prevents HuggingFace Hub API calls
-os.environ['HUGGINGFACE_HUB_CACHE'] = str(Path(MODELS_DIR).absolute())
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
-import pickle
-from collections import defaultdict
-from typing import List, Dict, Any, Optional
+# Force offline mode
+os.environ.update({
+    'HF_DATASETS_OFFLINE': '1',
+    'TRANSFORMERS_OFFLINE': '1',
+    'HF_HUB_OFFLINE': '1',
+    'HF_HUB_DISABLE_TELEMETRY': '1'
+})
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from fastmcp import FastMCP
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+mcp = FastMCP(
+    "JAC Safety & Regulations Knowledge Base",
+    instructions="""This MCP server provides access to UAE Joint Aviation Command (JAC) safety regulations and technical documents (~205 documents in Arabic and English).
 
-# Initialize FastMCP
-mcp = FastMCP("RAG Document Search Server")
+KNOWLEDGE BASE CONTAINS:
+- JAC REG 385 series (385-1 to 385-10): OSHEMS, aviation safety, ammunition/explosives, risk management, environmental management, emergency management, contractor safety
+- JAC Safety Guidelines (SGL): Emergency response, hazmat, helipads, flying displays
+- Base-specific Safety Operating Programs (ASC, FUJ, FWG, G10, G18, HAZ, JAI, NAG, SAB, SAR, SAS)
+- General safety instructions (aviation, ammunition storage, military displays, weather)
+- Safety policies and procedures (Arabic)
+- JAC Safety Magazines (2015, 2017, 2019, 2023)
+- Environmental awareness materials
+- Vehicle and traffic safety guidelines
+- UAE Life Safety Code 2018
 
-# ============================================================================
-# RAG HELPER FUNCTIONS
-# ============================================================================
+USE THIS TOOL FOR ANY QUESTIONS ABOUT:
+- JAC regulations and compliance requirements
+- Aviation safety procedures and programs
+- Ammunition, explosives, and weapons safety
+- OSHEMS (Occupational Safety, Health & Environmental Management)
+- Risk assessment and management
+- Safety investigations and incident reporting
+- Emergency management and response plans
+- Environmental protection and management
+- Contractor safety requirements
+- Base-specific safety procedures
+- Vehicle and traffic safety
+- Weather-related safety measures
 
-def load_rag_components():
-    """
-    Load embedding model, ChromaDB collection, and BM25 index.
-    Returns: (model, collection, bm25_data) tuple
-    Raises: Exception if components cannot be loaded
-    """
-    try:
-        # Load ChromaDB
-        client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
-        collection = client.get_collection(name=COLLECTION_NAME)
+CITATION REQUIREMENTS (CRITICAL):
+You MUST include citations for EVERY fact, requirement, or procedure:
+- Format: [JAC REG 385-7, Page 23] or [Safety_Manual.pdf, Page 15]
+- Always include document name (JAC REG number or filename) + page number
+- Multiple citations if information comes from different sources
 
-        # Load embedding model from local path
-        models_path = Path(MODELS_DIR).absolute()
+Example: "Ammunition storage facilities must maintain minimum safety distances [JAC REG 385-7, Page 23] and comply with environmental requirements [JAC REG 385-6, Page 15]."
 
-        # Construct the local model path (simple structure: models/model-name/)
-        model_name = EMBEDDING_MODEL.split('/')[-1]  # Get just "multilingual-e5-large"
-        embedding_model_path = models_path / model_name
+ALWAYS use search_documents() for ANY safety or regulation query."""
+)
 
-        # Check if model exists locally
-        if not embedding_model_path.exists():
-            raise Exception(f"Model not found at: {embedding_model_path}. Run: python simple-model-downloader.py")
+# Cache loaded components
+_model = None
+_collection = None
+_bm25_data = None
+_reranker = None
 
-        # Load from the actual local path (not model name)
-        model = SentenceTransformer(
-            str(embedding_model_path),  # Use local path instead of model name
-            device='cpu'  # Force CPU to avoid CUDA issues
+def load_components():
+    """Load RAG components (cached)"""
+    global _model, _collection, _bm25_data, _reranker
+
+    if _model is None:
+        if not EMBEDDING_MODEL_PATH.exists():
+            raise Exception(f"Model not found: {EMBEDDING_MODEL_PATH}")
+        _model = SentenceTransformer(
+            str(EMBEDDING_MODEL_PATH),
+            device='cpu',
+            local_files_only=True,
+            tokenizer_kwargs={'clean_up_tokenization_spaces': True}
         )
 
-        # Load BM25 index
-        bm25_data = None
-        if os.path.exists(BM25_INDEX_PATH):
-            with open(BM25_INDEX_PATH, 'rb') as f:
-                bm25_data = pickle.load(f)
+    if _collection is None:
+        client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+        _collection = client.get_collection(name=COLLECTION_NAME)
 
-        return model, collection, bm25_data
+    if _bm25_data is None and Path(BM25_INDEX_PATH).exists():
+        with open(BM25_INDEX_PATH, 'rb') as f:
+            _bm25_data = pickle.load(f)
 
-    except Exception as e:
-        raise Exception(f"Failed to load RAG components: {str(e)}")
+    if _reranker is None and USE_RERANKER and RERANKER_MODEL_PATH.exists():
+        try:
+            _reranker = CrossEncoder(
+                str(RERANKER_MODEL_PATH),
+                max_length=512,
+                device='cpu'
+            )
+        except:
+            pass  # Fall back to no reranking
 
+    return _model, _collection, _bm25_data, _reranker
 
-def perform_hybrid_search(
-    query: str,
-    model,
-    collection,
-    bm25_data,
-    top_k: int = 10,
-    alpha: float = SEMANTIC_WEIGHT
-) -> List[Dict[str, Any]]:
-    """
-    Perform hybrid search combining semantic (E5) + keyword (BM25).
-
-    This is adapted from simple-rag.py's hybrid_search() function.
-
-    Args:
-        query: Search query string
-        model: SentenceTransformer model
-        collection: ChromaDB collection
-        bm25_data: BM25 index data dict
-        top_k: Maximum number of results to return
-        alpha: Weight for semantic search (1-alpha is BM25 weight)
-
-    Returns:
-        List of dicts with keys: 'text', 'metadata', 'score'
-    """
+def hybrid_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    """Hybrid semantic + keyword search with optional reranking"""
+    model, collection, bm25_data, reranker = load_components()
     results = []
 
     # Semantic search
-    query_embedding = model.encode([f"query: {query}"])[0]
-    sem_results = collection.query(
-        query_embeddings=[query_embedding.tolist()],
-        n_results=top_k * 2
-    )
+    embedding = model.encode([f"query: {query}"], normalize_embeddings=True)[0]
+    sem = collection.query(query_embeddings=[embedding.tolist()], n_results=top_k * 2)
 
-    for doc, meta, dist in zip(
-        sem_results['documents'][0],
-        sem_results['metadatas'][0],
-        sem_results['distances'][0]
-    ):
+    for doc, meta, dist in zip(sem['documents'][0], sem['metadatas'][0], sem['distances'][0]):
         results.append({
             'text': doc,
             'metadata': meta,
-            'score': (1 - dist) * alpha
+            'score': (1 - dist) * SEMANTIC_WEIGHT
         })
 
-    # BM25 search
+    # BM25 keyword search
     if bm25_data:
-        scores = bm25_data['bm25'].get_scores(query.lower().split())
-        top_idx = sorted(
-            range(len(scores)),
-            key=lambda i: scores[i],
-            reverse=True
-        )[:top_k * 2]
+        tokens = re.findall(r'\w+', query.lower())
+        scores = bm25_data['bm25'].get_scores(tokens)
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k * 2]
 
-        max_score = max(scores[i] for i in top_idx) if top_idx else 1
-        if max_score > 0:
-            for idx in top_idx:
+        max_score = max(scores[i] for i in top_idx) if top_idx and max(scores) > 0 else 1
+        for idx in top_idx:
+            if scores[idx] > 0:
                 results.append({
                     'text': bm25_data['chunks'][idx],
                     'metadata': {},
-                    'score': (scores[idx] / max_score) * (1 - alpha)
+                    'score': (scores[idx] / max_score) * (1 - SEMANTIC_WEIGHT)
                 })
 
-    # Deduplicate and sort
-    seen = set()
-    unique = []
+    # Deduplicate and sort by score
+    seen, unique = set(), []
     for r in sorted(results, key=lambda x: x['score'], reverse=True):
         snippet = r['text'][:100]
         if snippet not in seen:
             seen.add(snippet)
             unique.append(r)
 
+    # Reranking stage (optional)
+    if reranker and USE_RERANKER and len(unique) > top_k:
+        # Prepare query-document pairs for reranking
+        pairs = [[query, r['text'][:512]] for r in unique]  # Limit text length for speed
+        rerank_scores = reranker.predict(pairs)
+
+        # Update scores with reranking
+        for i, score in enumerate(rerank_scores):
+            unique[i]['rerank_score'] = float(score)
+
+        # Sort by rerank score
+        unique = sorted(unique, key=lambda x: x.get('rerank_score', x['score']), reverse=True)
+
     return unique[:top_k]
 
+@mcp.tool(description="""Search UAE JAC safety regulations and technical documents (~205 docs covering aviation safety, ammunition/explosives, OSHEMS, environmental, risk management, emergency response, and base-specific procedures).
 
-def aggregate_documents(collection) -> List[Dict[str, Any]]:
-    """
-    Aggregate document-level information from chunk-level ChromaDB data.
+SEARCH CAPABILITIES:
+- JAC REG 385 series (385-1 OSHEMS, 385-2 Safety Programs, 385-3 Investigations, 385-4 Aviation, 385-5 Risk Mgmt, 385-6 Environmental, 385-7 Ammunition/Explosives, 385-8 Operations, 385-9 Contractors, 385-10 Emergency)
+- JAC Safety Guidelines (emergency response, hazmat, helipads, flying displays)
+- Base safety programs (ASC, FUJ, FWG, G10, G18, HAZ, JAI, NAG, SAB, SAR, SAS)
+- General safety instructions (Arabic & English)
+- Environmental awareness, vehicle safety, weather safety
+- UAE Life Safety Code 2018
 
-    Since ChromaDB stores chunks, we need to aggregate metadata by filename
-    to provide a document-level view.
+QUERY EXAMPLES:
+- "JAC REG 385-7 ammunition storage distance requirements"
+- "OSHEMS risk assessment procedures"
+- "emergency response plan for aviation incidents"
+- "FWG base safety operating procedures"
+- "hazardous materials handling requirements"
+- "contractor safety management"
 
-    Returns:
-        List of document dicts with aggregated metadata
-    """
+HOW TO USE:
+- Be specific with JAC REG numbers or topics
+- Use technical terms: OSHEMS, HAZMAT, SOP, SMS
+- For broad topics use max_results=15-25, specific queries use 5-10
+- Searches in both English and Arabic content
+
+METADATA RETURNED:
+- filename: Document name (e.g., "JAC REG 385-7 Ammunition...")
+- page: Page number where text appears
+- jac_reg: JAC REG number if found (e.g., "JAC REG 385-7")
+- chapters: Chapter/section references (e.g., "CHAPTER 3")
+- safety: Safety keywords (WARNING, CAUTION, DANGER, NOTE)
+- lang: Language (en/ar/table)
+- score: Relevance score (higher = more relevant)
+
+CITATION REQUIREMENT (MANDATORY):
+ALWAYS cite sources: [JAC REG 385-7, Page 23] or [filename.pdf, Page 15]
+Include citation for EVERY fact, requirement, or procedure in your response.
+
+Args:
+    query: Search query - be specific with JAC REG numbers or technical terms
+    max_results: Number of results (1-25, default 10). Use 15-25 for comprehensive coverage.
+
+Returns:
+    results: Text chunks with metadata (filename, page, jac_reg, chapters, safety, score)
+    total_found: Number of results returned
+    query: The search query used""")
+def search_documents(query: str, max_results: int = 10) -> Dict[str, Any]:
     try:
-        # Fetch all data from collection
-        all_data = collection.get()
+        if not query.strip():
+            return {'error': 'Query cannot be empty', 'results': [], 'total_found': 0}
 
-        if not all_data or not all_data['metadatas']:
-            return []
+        max_results = max(1, min(25, max_results))
+        results = hybrid_search(query, top_k=max_results)
+
+        return {
+            'results': results,
+            'total_found': len(results),
+            'query': query
+        }
+    except Exception as e:
+        return {'error': str(e), 'results': [], 'total_found': 0}
+
+@mcp.tool(description="""List all UAE JAC safety regulations and technical documents in the knowledge base (~205 documents).
+
+USE THIS TO:
+- See what JAC REG 385 regulations are available (385-1 through 385-10)
+- Find available base-specific safety programs (ASC, FUJ, FWG, G10, G18, HAZ, JAI, NAG, SAB, SAR, SAS)
+- Check which safety guidelines, environmental materials, or vehicle safety docs are indexed
+- Verify if a specific document or regulation has been indexed
+- Understand the scope before searching
+
+DOCUMENT TYPES AVAILABLE:
+- JAC REG 385 series: OSHEMS, safety programs, investigations, aviation, risk management, environmental, ammunition/explosives, operations, contractors, emergency
+- JAC Safety Guidelines (SGL): Emergency response, hazmat, helipads, flying displays
+- Base Safety Operating Programs: 11+ military bases
+- General safety instructions (Arabic & English)
+- Safety policies and procedures
+- JAC Safety Magazines (2015, 2017, 2019, 2023)
+- Environmental awareness materials
+- Vehicle and traffic safety
+- UAE Life Safety Code 2018
+
+METADATA RETURNED FOR EACH DOCUMENT:
+- filename: PDF filename
+- total_pages: Total pages in original document
+- indexed_pages: Pages successfully indexed and searchable
+- chunks: Number of searchable text segments
+- language: Document language (en=English, ar=Arabic, table=Tables)
+- jac_regulations: JAC REG numbers found in document (if any)
+- chapters: Chapters/sections identified (if any)
+- safety_keywords: Safety terms found (WARNING, CAUTION, DANGER, NOTE)
+
+SUMMARY STATISTICS:
+- total_documents: Total indexed documents (~205)
+- total_chunks: Total searchable text segments
+- total_pages: Total pages indexed
+
+Returns:
+    documents: List of all documents with detailed metadata (sorted by filename)
+    summary: Collection statistics""")
+def list_documents() -> Dict[str, Any]:
+    try:
+        _, collection, _ = load_components()
+        data = collection.get()
+
+        if not data or not data['metadatas']:
+            return {'documents': [], 'summary': {}}
 
         # Aggregate by filename
-        docs_by_filename = defaultdict(lambda: {
-            'chunks': [],
-            'metadata': {},
-            'pages': set(),
-            'jac_regs': set(),
-            'chapters': set(),
-            'safety_keywords': set(),
-            'acronyms': set(),
-            'sms_terms': set(),
+        docs = defaultdict(lambda: {
+            'chunks': 0, 'pages': set(), 'metadata': {},
+            'jac_regs': set(), 'chapters': set(), 'safety': set()
         })
 
-        for meta in all_data['metadatas']:
+        for meta in data['metadatas']:
             filename = meta.get('filename', 'Unknown')
-            doc = docs_by_filename[filename]
+            doc = docs[filename]
+            doc['chunks'] += 1
 
-            # Count chunks
-            doc['chunks'].append(1)
+            if 'page' in meta:
+                doc['pages'].add(meta['page'])
 
-            # Collect unique pages
-            if 'page_number' in meta:
-                doc['pages'].add(meta['page_number'])
-
-            # Store base metadata (from first chunk)
             if not doc['metadata']:
                 doc['metadata'] = {
                     'filename': filename,
-                    'doc_type': meta.get('doc_type', 'document'),
-                    'pdf_title': meta.get('pdf_title', filename),
-                    'total_pages': meta.get('total_pages', len(doc['pages'])),
-                    'classification': meta.get('classification', ''),
+                    'total_pages': meta.get('total_pages', 0),
+                    'lang': meta.get('lang', 'unknown')
                 }
 
-            # Aggregate pattern-based metadata
-            for key in ['jac_reg_numbers', 'chapters', 'safety_keywords', 'acronyms', 'sms_terms']:
+            # Aggregate patterns
+            for key in ['jac_reg', 'chapters', 'safety']:
                 if key in meta and meta[key]:
-                    # Split comma-separated values and add to set
-                    values = [v.strip() for v in meta[key].split(',')]
-                    short_key = key.replace('_numbers', 's').replace('_keywords', 's').replace('_terms', 's')
-                    doc[short_key].update(values)
+                    doc[key].update(meta[key].split(', '))
 
-        # Format final output
+        # Format output
         documents = []
-        for filename, data in docs_by_filename.items():
+        for filename, d in docs.items():
             doc_info = {
-                'filename': data['metadata']['filename'],
-                'pdf_title': data['metadata']['pdf_title'],
-                'doc_type': data['metadata']['doc_type'],
-                'total_pages': data['metadata']['total_pages'],
-                'indexed_pages': len(data['pages']),
-                'total_chunks': len(data['chunks']),
-                'classification': data['metadata']['classification'],
+                'filename': filename,
+                'total_pages': d['metadata']['total_pages'],
+                'indexed_pages': len(d['pages']),
+                'chunks': d['chunks'],
+                'language': d['metadata']['lang']
             }
 
-            # Add aggregated metadata (only if non-empty)
-            if data['jac_regs']:
-                doc_info['jac_regulations'] = sorted(data['jac_regs'])
-            if data['chapters']:
-                doc_info['chapters'] = sorted(data['chapters'])
-            if data['safety_keywords']:
-                doc_info['safety_keywords'] = sorted(data['safety_keywords'])
-            if data['acronyms']:
-                doc_info['acronyms'] = sorted(data['acronyms'])[:20]  # Limit for readability
-            if data['sms_terms']:
-                doc_info['sms_terms'] = sorted(data['sms_terms'])
+            if d['jac_regs']:
+                doc_info['jac_regulations'] = sorted(d['jac_regs'])
+            if d['chapters']:
+                doc_info['chapters'] = sorted(d['chapters'])
+            if d['safety']:
+                doc_info['safety_keywords'] = sorted(d['safety'])
 
             documents.append(doc_info)
 
-        return sorted(documents, key=lambda x: x['filename'])
-
-    except Exception as e:
-        raise Exception(f"Failed to aggregate documents: {str(e)}")
-
-
-# ============================================================================
-# FASTMCP TOOLS
-# ============================================================================
-
-@mcp.tool()
-def query_rag_database(query: str, max_results: int = 10) -> Dict[str, Any]:
-    """
-    Search the technical document database for relevant information.
-
-    This tool searches through indexed technical documents (JAC regulations, safety manuals,
-    OSHEMS documents, etc.) using a hybrid approach that combines:
-    - Semantic search: Understands the meaning of your query
-    - Keyword search: Matches specific terms and acronyms
-
-    When to use this tool:
-    - You need to find specific regulations, procedures, or safety information
-    - You want to look up technical terms, equipment codes, or JAC acronyms
-    - You need to locate requirements related to ammunition, explosives, or safety management
-    - You want to find information about OSHEMS, SMS, risk management, or safety investigations
-
-    How it works:
-    The tool will return relevant text chunks from the documents along with detailed metadata
-    including page numbers, document types, JAC regulation numbers, chapters, safety keywords,
-    and more. Each result includes a relevance score (higher is better).
-
-    Tips for better results:
-    - Use specific terms: "JAC REG 385-7" is better than "safety regulation"
-    - Include context: "ammunition storage procedures" vs just "storage"
-    - Try acronyms: "OSHEMS SMS procedures" will find relevant safety management content
-    - If you get too few results, try broader terms
-    - If results aren't relevant, try more specific terminology
-
-    IMPORTANT: Do NOT query more than 2 times to fetch data. If you need more information
-    after 2 queries, ask the user for clarification or to refine their question.
-
-    Args:
-        query: Your search question or keywords. Be as specific as possible.
-               Examples: "What are the safety distance requirements for ammunition storage?"
-                        "JAC REG 385-7 explosive handling procedures"
-                        "OSHEMS risk assessment requirements"
-
-        max_results: Maximum number of results to return (1-10). Default is 10.
-                    Use fewer results (3-5) for very specific queries.
-                    Use more results (8-10) for broader exploratory searches.
-
-    Returns:
-        A dictionary containing:
-        - results: List of relevant text chunks with metadata and scores
-        - query_info: Information about your query including warning if applicable
-        - total_found: Total number of results found
-
-        Each result contains:
-        - text: The relevant text chunk from the document
-        - score: Relevance score (0.0 to 1.0, higher is more relevant)
-        - metadata: Document information including:
-            - filename: Name of the source PDF
-            - pdf_title: Title of the document
-            - page_number: Page where this text appears
-            - total_pages: Total pages in the source document
-            - doc_type: Type of document (e.g., "JAC Regulation", "OSHEMS", "safety")
-            - section_title: Section or chapter heading (if available)
-            - jac_reg_numbers: JAC regulation numbers found (if any)
-            - chapters: Chapter references (if any)
-            - safety_keywords: Safety-related keywords (WARNING, CAUTION, DANGER, NOTE)
-            - acronyms: Technical acronyms found in this chunk
-            - sms_terms: Safety management system terms
-            - classification: Document classification (e.g., "FOUO")
-
-    Example usage:
-        To find ammunition storage requirements:
-        query_rag_database("ammunition storage safety distance requirements", max_results=5)
-
-        To look up a specific regulation:
-        query_rag_database("JAC REG 385-7 Chapter 3", max_results=3)
-    """
-    try:
-        # Validate inputs
-        if not query or not query.strip():
-            return {
-                'error': 'Query cannot be empty. Please provide a search question or keywords.',
-                'results': [],
-                'total_found': 0
-            }
-
-        max_results = max(1, min(10, max_results))  # Clamp to 1-10
-
-        # Load RAG components
-        model, collection, bm25_data = load_rag_components()
-
-        # Perform hybrid search
-        results = perform_hybrid_search(
-            query,
-            model,
-            collection,
-            bm25_data,
-            top_k=max_results
-        )
-
-        # Return results
-        return {
-            'results': results,
-            'total_found': len(results)
-        }
-
-    except Exception as e:
-        return {
-            'error': f'Search failed: {str(e)}',
-            'results': [],
-            'total_found': 0
-        }
-
-
-@mcp.tool()
-def list_documents() -> Dict[str, Any]:
-    """
-    List all documents currently indexed in the RAG database.
-
-    This tool provides an overview of all technical documents that have been indexed
-    and are available for searching. It shows document-level information aggregated
-    from all the chunks stored in the database.
-
-    When to use this tool:
-    - You want to see what documents are available before searching
-    - You need to know the scope of the knowledge base
-    - You want to understand what types of documents are indexed
-    - You need to verify if a specific document has been indexed
-    - You want to see document statistics (pages, chunks, etc.)
-
-    What you'll get:
-    For each document, you'll see:
-    - Filename and title
-    - Document type (JAC Regulation, OSHEMS, safety manual, etc.)
-    - Total pages and how many are indexed
-    - Number of searchable text chunks
-    - Classification (e.g., FOUO)
-    - Aggregated metadata: JAC regulations mentioned, chapters, safety keywords,
-      acronyms used, and SMS terms (if applicable)
-
-    This information helps you:
-    - Understand what's available before crafting specific queries
-    - Reference specific documents by name when searching
-    - Verify coverage of certain topics or regulation numbers
-    - Get a sense of the document structure (chapters, sections, etc.)
-
-    Returns:
-        A dictionary containing:
-        - documents: List of all indexed documents with detailed metadata
-        - summary: High-level statistics about the document collection
-
-        Each document includes:
-        - filename: Name of the source PDF file
-        - pdf_title: Title of the document (extracted or from filename)
-        - doc_type: Type classification (e.g., "JAC Regulation", "OSHEMS")
-        - total_pages: Total number of pages in the original PDF
-        - indexed_pages: Number of pages that were successfully indexed
-        - total_chunks: Number of searchable text chunks created
-        - classification: Security classification if applicable (e.g., "FOUO")
-        - jac_regulations: List of JAC regulation numbers found (if any)
-        - chapters: List of chapters/sections found (if any)
-        - safety_keywords: Safety-related terms found (WARNING, CAUTION, etc.)
-        - acronyms: Technical acronyms used in the document (up to 20 most common)
-        - sms_terms: Safety management system terms found (if any)
-
-    Example usage:
-        To see all available documents:
-        list_documents()
-
-        Then use the information to craft specific queries like:
-        query_rag_database("JAC REG 385-7 from document about ammunition")
-
-    Note: This operation may take a few seconds as it aggregates data from all chunks.
-    """
-    try:
-        # Load ChromaDB collection
-        client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
-        collection = client.get_collection(name=COLLECTION_NAME)
-
-        # Aggregate documents
-        documents = aggregate_documents(collection)
-
-        # Create summary statistics
         summary = {
             'total_documents': len(documents),
-            'total_chunks': sum(doc['total_chunks'] for doc in documents),
-            'total_pages': sum(doc['total_pages'] for doc in documents),
-            'document_types': list(set(doc['doc_type'] for doc in documents)),
+            'total_chunks': sum(d['chunks'] for d in documents),
+            'total_pages': sum(d['total_pages'] for d in documents)
         }
 
         return {
-            'documents': documents,
+            'documents': sorted(documents, key=lambda x: x['filename']),
             'summary': summary
         }
 
     except Exception as e:
-        return {
-            'error': f'Failed to list documents: {str(e)}',
-            'documents': [],
-            'summary': {}
-        }
-
-
-# ============================================================================
-# SERVER ENTRY POINT
-# ============================================================================
+        return {'error': str(e), 'documents': [], 'summary': {}}
 
 if __name__ == "__main__":
-    """
-    Run the FastMCP server.
-
-    The server will be available for MCP clients (like Claude Desktop) to connect.
-
-    Usage:
-        python simple-mcp.py
-
-    Configuration for Claude Desktop (add to config):
-    {
-      "mcpServers": {
-        "rag-documents": {
-          "command": "python",
-          "args": ["C:\\Users\\arif\\WebstormProjects\\sharepoint-downloader\\simple-mcp.py"]
-        }
-      }
-    }
-    """
-    print("🚀 Starting RAG Document Search MCP Server...")
-    print(f"\n📂 Configuration:")
-    print(f"   Models directory: {Path(MODELS_DIR).absolute()}")
-    print(f"   Database: {Path(VECTOR_DB_PATH).absolute()}")
-    print(f"   BM25 index: {Path(BM25_INDEX_PATH).absolute()}")
-    print(f"   Embedding Model: {EMBEDDING_MODEL}")
-    print(f"   Collection: {COLLECTION_NAME}")
-    print(f"\n🔒 Offline Mode: {'ENABLED' if USE_LOCAL_MODELS_ONLY else 'DISABLED'}")
-    print(f"   HF_HUB_OFFLINE: {os.environ.get('HF_HUB_OFFLINE', 'not set')}")
-    print(f"   TRANSFORMERS_OFFLINE: {os.environ.get('TRANSFORMERS_OFFLINE', 'not set')}")
-    print(f"   HF_DATASETS_OFFLINE: {os.environ.get('HF_DATASETS_OFFLINE', 'not set')}")
-    print("\n💡 Available tools:")
-    print("   - query_rag_database: Search documents with hybrid search")
-    print("   - list_documents: List all indexed documents")
-    print("\n✅ Server ready for MCP connections\n")
-
-    # Run the FastMCP server
+    print(f"RAG MCP Server")
+    print(f"Database: {VECTOR_DB_PATH}")
+    print(f"Model: {EMBEDDING_MODEL_PATH.name}")
+    print(f"Tools: search_documents, list_documents\n")
     mcp.run()

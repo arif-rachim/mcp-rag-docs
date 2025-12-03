@@ -9,11 +9,13 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 
 from tqdm import tqdm
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import fitz
 from rank_bm25 import BM25Okapi
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 import logging
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # Disable transformers warnings
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -27,11 +29,14 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 SEARCH_MODE = 'hybrid'
 SEMANTIC_WEIGHT = 0.7
+NUM_WORKERS = min(cpu_count() - 1, 8) or 1  # Use CPU-1 cores, max 8 workers
 
 # Local model paths (offline mode)
 EMBEDDING_MODEL_PATH = MODELS_DIR / 'multilingual-e5-large'
 NER_MODEL_PATH = MODELS_DIR / 'ner' / 'bert-base-multilingual-cased-ner-hrl'
+RERANKER_MODEL_PATH = MODELS_DIR / 'bge-reranker-v2-m3'
 COLLECTION_NAME = 'technical_documents'
+USE_RERANKER = True  # Set to False to disable reranking
 
 # Force offline mode - no internet calls
 os.environ.update({
@@ -156,8 +161,8 @@ def bm25_search(query, top_k=10):
     except:
         return []
 
-def hybrid_search(query, model, collection, top_k=5):
-    """Optimized hybrid search with better scoring"""
+def hybrid_search(query, model, collection, top_k=5, reranker=None):
+    """Optimized hybrid search with optional reranking"""
     results = []
 
     # Semantic search
@@ -191,10 +196,87 @@ def hybrid_search(query, model, collection, top_k=5):
             seen.add(snippet)
             unique.append(r)
 
+    # Reranking stage (optional)
+    if reranker and USE_RERANKER and len(unique) > top_k:
+        # Prepare query-document pairs for reranking
+        pairs = [[query, r['text'][:512]] for r in unique]  # Limit text length for speed
+        rerank_scores = reranker.predict(pairs)
+
+        # Update scores with reranking
+        for i, score in enumerate(rerank_scores):
+            unique[i]['rerank_score'] = float(score)
+
+        # Sort by rerank score
+        unique = sorted(unique, key=lambda x: x.get('rerank_score', x['score']), reverse=True)
+
     return unique[:top_k]
 
+def extract_and_chunk_pdf(pdf_path, use_ner=False):
+    """Worker function: Extract and chunk PDF (no embedding/storage)
+    Returns: (filename, chunks_list, metadata_list) or None on error
+    """
+    try:
+        filename = os.path.basename(pdf_path)
+        pages = extract_pdf(pdf_path)
+
+        if not pages:
+            return None
+
+        # Get total page count
+        total_pages = max(p['page'] for p in pages)
+
+        all_chunks, all_meta = [], []
+
+        # Load NER model only if requested (in worker process)
+        ner = None
+        if use_ner and NER_MODEL_PATH.exists():
+            try:
+                ner = pipeline(
+                    'ner',
+                    model=AutoModelForTokenClassification.from_pretrained(str(NER_MODEL_PATH), local_files_only=True),
+                    tokenizer=AutoTokenizer.from_pretrained(str(NER_MODEL_PATH), local_files_only=True, clean_up_tokenization_spaces=True),
+                    device=-1,
+                    aggregation_strategy="simple"
+                )
+            except:
+                pass
+
+        for page_data in pages:
+            chunks = chunk_text(page_data['text'])
+
+            for idx, chunk in enumerate(chunks):
+                meta = extract_patterns(chunk)
+                meta.update({
+                    'filename': filename,
+                    'page': page_data['page'],
+                    'total_pages': total_pages,
+                    'chunk': idx,
+                    'lang': page_data.get('lang', 'unknown')
+                })
+
+                # NER on first chunk of each page
+                if ner and idx == 0 and len(chunk) > 100:
+                    try:
+                        entities = ner(chunk[:500], aggregation_strategy="simple")
+                        persons = [e['word'] for e in entities if 'PER' in e['entity_group']]
+                        orgs = [e['word'] for e in entities if 'ORG' in e['entity_group']]
+                        if persons:
+                            meta['persons'] = ', '.join(set(persons)[:3])
+                        if orgs:
+                            meta['orgs'] = ', '.join(set(orgs)[:3])
+                    except:
+                        pass
+
+                all_chunks.append(chunk)
+                all_meta.append(meta)
+
+        return (filename, all_chunks, all_meta)
+
+    except Exception as e:
+        return None
+
 def process_pdf(pdf_path, ner, embed_model, client, progress_bar=None):
-    """Process PDF and store directly to database"""
+    """Legacy function: Process PDF and store directly to database (sequential mode)"""
     filename = os.path.basename(pdf_path)
     if progress_bar:
         progress_bar.set_description(f"Processing {filename[:50]}")
@@ -266,8 +348,20 @@ def search(query, top_k=5):
         tokenizer_kwargs={'clean_up_tokenization_spaces': True}
     )
 
+    # Load reranker if available and enabled
+    reranker = None
+    if USE_RERANKER and RERANKER_MODEL_PATH.exists():
+        try:
+            reranker = CrossEncoder(
+                str(RERANKER_MODEL_PATH),
+                max_length=512,
+                device='cpu'
+            )
+        except:
+            pass  # Fall back to no reranking
+
     if SEARCH_MODE == 'hybrid':
-        results = hybrid_search(query, model, collection, top_k)
+        results = hybrid_search(query, model, collection, top_k, reranker)
     elif SEARCH_MODE == 'keyword':
         results = [{'text': d, 'meta': {}, 'score': s, 'type': 'keyword'} for d, s in bm25_search(query, top_k)]
     else:
@@ -298,9 +392,9 @@ def search(query, top_k=5):
         text_preview = r['text'][:150].replace('\n', ' ')
         print(f"    {text_preview}...\n")
 
-def main():
-    """Main indexing function"""
-    print("Indexing PDFs (offline mode)...")
+def main(use_multiprocessing=True):
+    """Main indexing function with optional multiprocessing"""
+    print(f"Indexing PDFs (offline mode, {'PARALLEL' if use_multiprocessing else 'SEQUENTIAL'})...")
 
     pdf_files = list(Path(INPUT_FOLDER).glob("*.pdf"))
     if not pdf_files:
@@ -319,22 +413,12 @@ def main():
         Path(BM25_INDEX_PATH).unlink()
     print("Starting fresh indexing...\n")
 
-    # Load NER model
-    ner = None
-    try:
-        if NER_MODEL_PATH.exists():
-            ner = pipeline(
-                'ner',
-                model=AutoModelForTokenClassification.from_pretrained(str(NER_MODEL_PATH), local_files_only=True),
-                tokenizer=AutoTokenizer.from_pretrained(str(NER_MODEL_PATH), local_files_only=True, clean_up_tokenization_spaces=True),
-                device=-1,
-                aggregation_strategy="simple"
-            )
-            print(f"NER loaded from {NER_MODEL_PATH.name}")
-        else:
-            print(f"NER model not found: {NER_MODEL_PATH}")
-    except Exception as e:
-        print(f"NER skip: {e}")
+    # Check if NER is available
+    use_ner = NER_MODEL_PATH.exists()
+    if use_ner:
+        print(f"NER model found: {NER_MODEL_PATH.name}")
+    else:
+        print(f"NER model not found, skipping entity extraction")
 
     # Load embedding model
     if not EMBEDDING_MODEL_PATH.exists():
@@ -353,38 +437,103 @@ def main():
 
     client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
 
-    # Process PDFs with progress bar
-    print(f"\nProcessing {len(pdf_files)} PDFs...\n")
-    total = 0
-    processed = 0
-    failed = 0
+    # MULTIPROCESSING MODE
+    if use_multiprocessing and len(pdf_files) > 1:
+        print(f"\nUsing {NUM_WORKERS} worker processes for parallel PDF extraction...\n")
 
-    with tqdm(total=len(pdf_files), desc="Processing PDFs", unit="file") as pbar:
-        for pdf in pdf_files:
+        # Create worker function with partial to pass use_ner
+        worker_func = partial(extract_and_chunk_pdf, use_ner=use_ner)
+
+        # Process PDFs in parallel
+        total_chunks = 0
+        processed = 0
+        failed = 0
+
+        with Pool(processes=NUM_WORKERS) as pool:
+            # Use imap_unordered for better performance with progress bar
+            with tqdm(total=len(pdf_files), desc="Extracting PDFs", unit="file") as pbar:
+                for result in pool.imap_unordered(worker_func, pdf_files):
+                    if result is None:
+                        failed += 1
+                        pbar.update(1)
+                        continue
+
+                    filename, chunks, metadata = result
+                    processed += 1
+
+                    # Generate embeddings and store in main process
+                    if chunks:
+                        try:
+                            embeddings = create_embeddings(chunks, embed_model)
+                            store_chromadb(chunks, embeddings, metadata, client)
+                            total_chunks += len(chunks)
+                        except Exception as e:
+                            tqdm.write(f"✗ Error storing {filename}: {e}")
+                            failed += 1
+
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'processed': processed,
+                        'failed': failed,
+                        'chunks': total_chunks
+                    })
+
+    # SEQUENTIAL MODE (fallback)
+    else:
+        print(f"\nProcessing {len(pdf_files)} PDFs sequentially...\n")
+        total_chunks = 0
+        processed = 0
+        failed = 0
+
+        # Load NER in sequential mode
+        ner = None
+        if use_ner:
             try:
-                chunks = process_pdf(pdf, ner, embed_model, client, pbar)
-                total += chunks
-                processed += 1
+                ner = pipeline(
+                    'ner',
+                    model=AutoModelForTokenClassification.from_pretrained(str(NER_MODEL_PATH), local_files_only=True),
+                    tokenizer=AutoTokenizer.from_pretrained(str(NER_MODEL_PATH), local_files_only=True, clean_up_tokenization_spaces=True),
+                    device=-1,
+                    aggregation_strategy="simple"
+                )
             except Exception as e:
-                failed += 1
-                tqdm.write(f"✗ Error with {pdf.name}: {e}")
+                print(f"NER skip: {e}")
 
-            pbar.update(1)
-            pbar.set_postfix({
-                'processed': processed,
-                'failed': failed,
-                'chunks': total
-            })
+        with tqdm(total=len(pdf_files), desc="Processing PDFs", unit="file") as pbar:
+            for pdf in pdf_files:
+                try:
+                    chunks = process_pdf(pdf, ner, embed_model, client, pbar)
+                    total_chunks += chunks
+                    processed += 1
+                except Exception as e:
+                    failed += 1
+                    tqdm.write(f"✗ Error with {pdf.name}: {e}")
+
+                pbar.update(1)
+                pbar.set_postfix({
+                    'processed': processed,
+                    'failed': failed,
+                    'chunks': total_chunks
+                })
 
     # Build BM25 index
-    if total > 0:
+    if total_chunks > 0:
         print("\nBuilding BM25 index...")
         collection = client.get_collection(name=COLLECTION_NAME)
         docs = collection.get()
         if docs and docs['documents']:
             build_bm25(docs['documents'])
 
-    print(f"\n✓ Done! Processed {processed}/{len(pdf_files)} files, {total} chunks indexed, {failed} failed")
+    print(f"\n✓ Done! Processed {processed}/{len(pdf_files)} files, {total_chunks} chunks indexed, {failed} failed")
 
 if __name__ == '__main__':
-    search(' '.join(sys.argv[2:])) if len(sys.argv) > 1 and sys.argv[1] == 'search' else main()
+    # Required for multiprocessing on Windows
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    if len(sys.argv) > 1 and sys.argv[1] == 'search':
+        search(' '.join(sys.argv[2:]))
+    elif len(sys.argv) > 1 and sys.argv[1] == '--sequential':
+        main(use_multiprocessing=False)
+    else:
+        main(use_multiprocessing=True)

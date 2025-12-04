@@ -131,11 +131,13 @@ def hybrid_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k * 2]
 
         max_score = max(scores[i] for i in top_idx) if top_idx and max(scores) > 0 else 1
+        metadatas = bm25_data.get('metadatas', [])
         for idx in top_idx:
             if scores[idx] > 0:
+                meta = metadatas[idx] if metadatas and idx < len(metadatas) else {}
                 results.append({
                     'text': bm25_data['chunks'][idx],
-                    'metadata': {},
+                    'metadata': meta,
                     'score': (scores[idx] / max_score) * (1 - SEMANTIC_WEIGHT)
                 })
 

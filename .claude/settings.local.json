@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(if not exist public mkdir public)",
+      "Bash(copy node_modulespdfjs-distbuildpdf.worker.min.mjs publicpdf.worker.min.mjs)",
+      "Bash(powershell -Command:*)"
     ],
     "deny": [],
     "ask": []

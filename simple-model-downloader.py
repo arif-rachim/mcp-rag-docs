@@ -2,11 +2,12 @@
 from pathlib import Path
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer, AutoModelForTokenClassification
-
-EMBEDDING_MODEL = 'intfloat/multilingual-e5-large'
-NER_MODEL = 'Davlan/bert-base-multilingual-cased-ner-hrl'
-RERANKER_MODEL = 'BAAI/bge-reranker-v2-m3'
-MODELS_DIR = Path('./models')
+from config import (
+    EMBEDDING_MODEL_ID as EMBEDDING_MODEL,
+    NER_MODEL_ID as NER_MODEL,
+    RERANKER_MODEL_ID as RERANKER_MODEL,
+    MODELS_DIR
+)
 
 if __name__ == '__main__':
     print("Setting up offline models for RAG system...\n")

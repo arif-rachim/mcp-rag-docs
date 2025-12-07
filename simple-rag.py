@@ -20,22 +20,24 @@ from functools import partial
 # Disable transformers warnings
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Config
-INPUT_FOLDER = './downloads'
-VECTOR_DB_PATH = './chroma_store'
-BM25_INDEX_PATH = './bm25_index.pkl'
-MODELS_DIR = Path('./models')
+# Import shared configuration
+from config import (
+    VECTOR_DB_PATH,
+    BM25_INDEX_PATH,
+    MODELS_DIR,
+    EMBEDDING_MODEL_PATH,
+    NER_MODEL_PATH,
+    RERANKER_MODEL_PATH,
+    COLLECTION_NAME,
+    SEMANTIC_WEIGHT,
+    USE_RERANKER,
+    DOWNLOADS_FOLDER as INPUT_FOLDER
+)
+
+# Processing-specific constants (keep local)
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
-SEMANTIC_WEIGHT = 0.7
 NUM_WORKERS = min(cpu_count() - 1, 8) or 1  # Use CPU-1 cores, max 8 workers
-
-# Local model paths (offline mode)
-EMBEDDING_MODEL_PATH = MODELS_DIR / 'multilingual-e5-large'
-NER_MODEL_PATH = MODELS_DIR / 'ner' / 'bert-base-multilingual-cased-ner-hrl'
-RERANKER_MODEL_PATH = MODELS_DIR / 'bge-reranker-v2-m3'
-COLLECTION_NAME = 'technical_documents'
-USE_RERANKER = True  # Set to False to disable reranking
 
 # Force offline mode - no internet calls
 os.environ.update({

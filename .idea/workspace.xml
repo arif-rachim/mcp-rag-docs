@@ -5,8 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="3dd8ae42-e308-4c05-bb70-896c7da1363c" name="Changes" comment="Configure project settings for RAG search, update models, and enhance hybrid search logic">
+      <change beforePath="$PROJECT_DIR$/.claude/settings.local.json" beforeDir="false" afterPath="$PROJECT_DIR$/.claude/settings.local.json" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/simple-downloader.py" beforeDir="false" afterPath="$PROJECT_DIR$/simple-downloader.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/simple-mcp.py" beforeDir="false" afterPath="$PROJECT_DIR$/simple-mcp.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/simple-model-downloader.py" beforeDir="false" afterPath="$PROJECT_DIR$/simple-model-downloader.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/simple-rag.py" beforeDir="false" afterPath="$PROJECT_DIR$/simple-rag.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />

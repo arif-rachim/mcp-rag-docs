@@ -5,14 +5,14 @@ from urllib.parse import quote
 import requests
 from requests_ntlm import HttpNtlmAuth
 import urllib3
+from config import DOWNLOADS_FOLDER as OUTPUT_FOLDER
 
-# Configuration
+# Configuration (SharePoint-specific)
 SITE_URL = 'https://sharepoint.company.com/sites/mysite'
 USERNAME = 'username'
 PASSWORD = 'password'
 DOMAIN = 'DOMAIN'
 LIBRARY_NAME = 'Shared Documents'
-OUTPUT_FOLDER = './downloads'
 MAX_RESULTS = 5000
 IGNORE_CERT = True
 

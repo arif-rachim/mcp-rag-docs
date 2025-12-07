@@ -1,4 +1,44 @@
 function ResultsView({ results, loading, onResultClick }) {
+  // Helper function to highlight keywords in text
+  const highlightText = (text, highlightedTerms) => {
+    if (!highlightedTerms || highlightedTerms.length === 0) {
+      return text;
+    }
+
+    // Create regex pattern from highlighted terms (case-insensitive word boundary matching)
+    const pattern = highlightedTerms
+      .map(term => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) // Escape special regex chars
+      .join('|');
+
+    const regex = new RegExp(`\\b(${pattern})\\b`, 'gi');
+
+    // Split text and wrap matched terms with <mark> tag
+    const parts = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+      // Add text before match
+      if (match.index > lastIndex) {
+        parts.push(text.substring(lastIndex, match.index));
+      }
+      // Add highlighted match
+      parts.push(
+        <mark key={match.index} className="bg-yellow-200 font-medium px-0.5 rounded">
+          {match[0]}
+        </mark>
+      );
+      lastIndex = regex.lastIndex;
+    }
+
+    // Add remaining text
+    if (lastIndex < text.length) {
+      parts.push(text.substring(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : text;
+  };
+
   if (loading) {
     return (
       <div className="space-y-5">
@@ -60,8 +100,21 @@ function ResultsView({ results, loading, onResultClick }) {
                 </h3>
 
                 <div className="text-sm text-gray-600 leading-relaxed line-clamp-3">
-                  {item.text}
+                  {highlightText(item.text, item.highlighted_terms)}
                 </div>
+
+                {item.highlighted_terms && item.highlighted_terms.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-2">
+                    {item.highlighted_terms.map((term, termIdx) => (
+                      <span
+                        key={termIdx}
+                        className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800 border border-yellow-300"
+                      >
+                        {term}
+                      </span>
+                    ))}
+                  </div>
+                )}
 
                 <div className="flex items-center text-xs text-gray-500 mt-2 space-x-2">
                   <span>{item.metadata.lang}</span>
@@ -77,6 +130,14 @@ function ResultsView({ results, loading, onResultClick }) {
                       <>Score: {item.score?.toFixed(3)}</>
                     )}
                   </span>
+                  {item.highlighted_terms && item.highlighted_terms.length > 0 && (
+                    <>
+                      <span>•</span>
+                      <span className="text-yellow-600">
+                        {item.highlighted_terms.length} keyword{item.highlighted_terms.length > 1 ? 's' : ''} matched
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
             </div>

@@ -48,6 +48,7 @@ class SearchResult(BaseModel):
     metadata: ChunkMetadata
     score: float
     rerank_score: float | None = None
+    highlighted_terms: List[str] | None = None
 
 class SearchResponse(BaseModel):
     """Response from search_documents"""
@@ -208,6 +209,30 @@ def load_components():
 
     return _model, _collection, _bm25_data, _reranker
 
+def extract_highlighted_terms(query: str, text: str) -> List[str]:
+    """
+    Extract query terms that appear in the text for highlighting.
+    Supports both English and Arabic text.
+
+    Args:
+        query: The search query
+        text: The document text
+
+    Returns:
+        List of unique terms from query that appear in text
+    """
+    # Tokenize query (handles Arabic and English)
+    query_tokens = set(re.findall(r'\w+', query.lower()))
+
+    # Tokenize text
+    text_tokens = set(re.findall(r'\w+', text.lower()))
+
+    # Find matching terms
+    matched_terms = query_tokens & text_tokens
+
+    # Return sorted list for consistency
+    return sorted(matched_terms) if matched_terms else None
+
 def semantic_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
     """Semantic vector search only"""
     model, collection, _, reranker = load_components()
@@ -221,7 +246,8 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         results.append({
             'text': doc,
             'metadata': meta,
-            'score': 1 - dist  # Distance to similarity score
+            'score': 1 - dist,  # Distance to similarity score
+            'highlighted_terms': extract_highlighted_terms(query, doc)
         })
 
     # Sort by score
@@ -256,10 +282,12 @@ def keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
     for idx in top_idx:
         if scores[idx] > 0:
             meta = metadatas[idx] if metadatas and idx < len(metadatas) else {}
+            doc_text = bm25_data['chunks'][idx]
             results.append({
-                'text': bm25_data['chunks'][idx],
+                'text': doc_text,
                 'metadata': meta,
-                'score': float(scores[idx])
+                'score': float(scores[idx]),
+                'highlighted_terms': extract_highlighted_terms(query, doc_text)
             })
 
     # Reranking stage (optional)
@@ -287,7 +315,8 @@ def hybrid_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         results.append({
             'text': doc,
             'metadata': meta,
-            'score': (1 - dist) * SEMANTIC_WEIGHT
+            'score': (1 - dist) * SEMANTIC_WEIGHT,
+            'highlighted_terms': extract_highlighted_terms(query, doc)
         })
 
     # BM25 keyword search
@@ -301,10 +330,12 @@ def hybrid_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         for idx in top_idx:
             if scores[idx] > 0:
                 meta = metadatas[idx] if metadatas and idx < len(metadatas) else {}
+                doc_text = bm25_data['chunks'][idx]
                 results.append({
-                    'text': bm25_data['chunks'][idx],
+                    'text': doc_text,
                     'metadata': meta,
-                    'score': (scores[idx] / max_score) * (1 - SEMANTIC_WEIGHT)
+                    'score': (scores[idx] / max_score) * (1 - SEMANTIC_WEIGHT),
+                    'highlighted_terms': extract_highlighted_terms(query, doc_text)
                 })
 
     # Deduplicate and sort by score
@@ -441,7 +472,13 @@ RETURN VALUES:
                 "sop": str | None     # SOP indicator if found
             },
             "score": float,           # Hybrid search relevance score (0-1)
-            "rerank_score": float | None  # Optional reranking score if enabled
+            "rerank_score": float | None,  # Optional reranking score if enabled
+            "highlighted_terms": List[str] | None  # Query terms found in document
+                # Returns lowercase list of query words that appear in the document
+                # Example: query "ammunition storage" → ["ammunition", "storage"]
+                # Supports English and Arabic text
+                # Use this to highlight matching keywords in the UI
+                # Returns null if no query terms match
         }
     ],
     "total_found": int,  # Number of results returned
@@ -465,7 +502,8 @@ Example:
                 "sop": null
             },
             "score": 0.856,
-            "rerank_score": 0.923
+            "rerank_score": 0.923,
+            "highlighted_terms": ["ammunition", "storage"]
         }
     ],
     "total_found": 1,
@@ -504,7 +542,8 @@ def search_documents(query: str, max_results: int = 10, search_mode: str = "hybr
                 text=r['text'],
                 metadata=ChunkMetadata(**r['metadata']),
                 score=r['score'],
-                rerank_score=r.get('rerank_score')
+                rerank_score=r.get('rerank_score'),
+                highlighted_terms=r.get('highlighted_terms')
             ))
 
         response = SearchResponse(

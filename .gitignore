@@ -3,3 +3,6 @@
 /downloads/
 /New folder/
 /bm25_index.pkl
+/simple-webui/node_modules/
+/simple-webui/dist/
+/simple-webui/.claude/
